@@ -344,9 +344,6 @@ impl InitialReceiveTransition {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Object)]
-pub struct ReceiverBuilder(payjoin::receive::v2::ReceiverBuilder);
-
 /// Primitive representation of a transaction output for the FFI boundary.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct TxOut {
@@ -394,7 +391,7 @@ impl TxIn {
 }
 
 /// Primitive representation of an outpoint for the FFI boundary.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct OutPoint {
     /// Hex-encoded txid (big-endian).
     pub txid: String,
@@ -457,6 +454,9 @@ impl Weight {
 impl From<payjoin::bitcoin::Weight> for Weight {
     fn from(value: payjoin::bitcoin::Weight) -> Self { Weight { weight_units: value.to_wu() } }
 }
+
+#[derive(Clone, Debug, uniffi::Object)]
+pub struct ReceiverBuilder(payjoin::receive::v2::ReceiverBuilder);
 
 #[uniffi::export]
 impl ReceiverBuilder {
@@ -728,6 +728,23 @@ impl UncheckedOriginalPayload {
         )))))
     }
 
+    pub fn extract_tx_to_check_broadcast_suitability(&self) -> Vec<u8> {
+        payjoin::bitcoin::consensus::encode::serialize(
+            &self.0.clone().extract_tx_to_check_broadcast_suitability(),
+        )
+    }
+
+    pub fn apply_broadcast_suitability(
+        &self,
+        min_fee_rate_sat_per_kwu: Option<u64>,
+        can_broadcast: bool,
+    ) -> Result<UncheckedOriginalPayloadTransition, FfiValidationError> {
+        let min_fee_rate = validate_fee_rate_sat_per_kwu_opt(min_fee_rate_sat_per_kwu)?;
+        Ok(UncheckedOriginalPayloadTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().apply_broadcast_suitability(min_fee_rate, can_broadcast),
+        )))))
+    }
+
     /// Call this method if the only way to initiate a Payjoin with this receiver
     /// requires manual intervention, as in most consumer wallets.
     ///
@@ -738,6 +755,65 @@ impl UncheckedOriginalPayload {
             self.0.clone().assume_interactive_receiver(),
         ))))
     }
+}
+
+trait FfiTaggedReference<V> {
+    fn get_result(&self) -> bool;
+    fn get_value(&self) -> V;
+}
+
+fn to_tagged_references<V, T, R, Vffi>(
+    references: impl Iterator<Item = payjoin::receive::Reference<V, T>>,
+    checks: Vec<Arc<R>>,
+) -> Result<
+    impl Iterator<Item = payjoin::receive::TaggedReference<V, T>>,
+    payjoin::error::ImplementationError,
+>
+where
+    V: Clone,
+    T: payjoin::receive::Tag,
+    R: FfiTaggedReference<Vffi>,
+    Vffi: From<V> + PartialEq,
+{
+    payjoin::receive::check_references(references, &mut move |pj_ref: &V| {
+        let found_result = checks.iter().find_map(|ffi_ref| {
+            if Vffi::from(pj_ref.clone()) == ffi_ref.get_value() {
+                Some(ffi_ref.get_result())
+            } else {
+                None
+            }
+        });
+        match found_result {
+            Some(result) => Ok(result),
+            None => Err(payjoin::ImplementationError::from(
+                "Returned input owned checks is missing result for script {script}",
+            )),
+        }
+    })
+}
+
+#[derive(Debug, uniffi::Object)]
+pub struct InputOwnedReference(
+    payjoin::receive::Reference<payjoin::bitcoin::ScriptBuf, payjoin::receive::InputOwnedTag>,
+);
+
+#[uniffi::export]
+impl InputOwnedReference {
+    pub fn get_value(&self) -> Vec<u8> { self.0.get_value().to_bytes() }
+    pub fn mark(&self, result: bool) -> Arc<InputOwnedTaggedReference> {
+        Arc::new(InputOwnedTaggedReference { value: self.get_value(), result })
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct InputOwnedTaggedReference {
+    value: Vec<u8>,
+    result: bool,
+}
+
+impl FfiTaggedReference<Vec<u8>> for InputOwnedTaggedReference {
+    fn get_result(&self) -> bool { self.result }
+    fn get_value(&self) -> Vec<u8> { self.value.clone() }
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -783,6 +859,7 @@ impl MaybeInputsOwned {
             &self.0.clone().extract_tx_to_schedule_broadcast(),
         )
     }
+
     pub fn check_inputs_not_owned(
         &self,
         is_owned: Arc<dyn IsScriptOwned>,
@@ -793,6 +870,53 @@ impl MaybeInputsOwned {
             }),
         ))))
     }
+
+    pub fn get_input_script_refs(&self) -> Result<Vec<Arc<InputOwnedReference>>, ReceiverError> {
+        self.0
+            .clone()
+            .get_input_script_refs()
+            .map(|iter| {
+                iter.map(|input_script_ref| Arc::new(InputOwnedReference(input_script_ref)))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(ReceiverError::from)
+    }
+
+    pub fn apply_input_owned_checks(
+        &self,
+        checked_input_scripts: Vec<Arc<InputOwnedTaggedReference>>,
+    ) -> Result<MaybeInputsOwnedTransition, ReceiverError> {
+        let references = self.0.clone().get_input_script_refs()?;
+        let checked = to_tagged_references(references, checked_input_scripts)
+            .map_err(|e| ReceiverError::Implementation(Arc::new(ImplementationError::from(e))))?;
+        Ok(MaybeInputsOwnedTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().apply_input_owned_checks(checked),
+        )))))
+    }
+}
+
+#[derive(Debug, uniffi::Object)]
+pub struct InputSeenReference(
+    payjoin::receive::Reference<payjoin::bitcoin::OutPoint, payjoin::receive::InputSeenTag>,
+);
+
+#[uniffi::export]
+impl InputSeenReference {
+    pub fn get_value(&self) -> OutPoint { self.0.get_value().into() }
+    pub fn mark(&self, result: bool) -> Arc<InputSeenTaggedReference> {
+        Arc::new(InputSeenTaggedReference { value: self.get_value(), result })
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct InputSeenTaggedReference {
+    value: OutPoint,
+    result: bool,
+}
+
+impl FfiTaggedReference<OutPoint> for InputSeenTaggedReference {
+    fn get_result(&self) -> bool { self.result }
+    fn get_value(&self) -> OutPoint { self.value.clone() }
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -844,6 +968,50 @@ impl MaybeInputsSeen {
             }),
         ))))
     }
+
+    pub fn get_input_outpoint_refs(&self) -> Vec<Arc<InputSeenReference>> {
+        self.0
+            .clone()
+            .get_input_outpoint_refs()
+            .map(|input_outpoint_ref| Arc::new(InputSeenReference(input_outpoint_ref)))
+            .collect::<Vec<_>>()
+    }
+
+    pub fn apply_input_seen_checks(
+        &self,
+        checked_input_outpoints: Vec<Arc<InputSeenTaggedReference>>,
+    ) -> Result<MaybeInputsSeenTransition, ReceiverError> {
+        let references = self.0.clone().get_input_outpoint_refs();
+        let checked = to_tagged_references(references, checked_input_outpoints)
+            .map_err(|e| ReceiverError::Implementation(Arc::new(ImplementationError::from(e))))?;
+        Ok(MaybeInputsSeenTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().apply_input_seen_checks(checked),
+        )))))
+    }
+}
+
+#[derive(Debug, uniffi::Object)]
+pub struct OutputOwnedReference(
+    payjoin::receive::Reference<payjoin::bitcoin::ScriptBuf, payjoin::receive::OutputOwnedTag>,
+);
+
+#[uniffi::export]
+impl OutputOwnedReference {
+    pub fn get_value(&self) -> Vec<u8> { self.0.get_value().to_bytes() }
+    pub fn mark(&self, result: bool) -> Arc<OutputOwnedTaggedReference> {
+        Arc::new(OutputOwnedTaggedReference { value: self.get_value(), result })
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Object)]
+pub struct OutputOwnedTaggedReference {
+    value: Vec<u8>,
+    result: bool,
+}
+
+impl FfiTaggedReference<Vec<u8>> for OutputOwnedTaggedReference {
+    fn get_result(&self) -> bool { self.result }
+    fn get_value(&self) -> Vec<u8> { self.value.clone() }
 }
 
 /// The receiver has not yet identified which outputs belong to the receiver.
@@ -892,6 +1060,26 @@ impl OutputsUnknown {
                     .map_err(|e| ImplementationError::new(e).into())
             }),
         ))))
+    }
+
+    pub fn get_output_script_refs(&self) -> Vec<Arc<OutputOwnedReference>> {
+        self.0
+            .clone()
+            .get_output_script_refs()
+            .map(|output_script_ref| Arc::new(OutputOwnedReference(output_script_ref)))
+            .collect::<Vec<_>>()
+    }
+
+    pub fn apply_output_owned_checks(
+        &self,
+        checked_output_scripts: Vec<Arc<OutputOwnedTaggedReference>>,
+    ) -> Result<OutputsUnknownTransition, ReceiverError> {
+        let references = self.0.clone().get_output_script_refs();
+        let checked = to_tagged_references(references, checked_output_scripts)
+            .map_err(|e| ReceiverError::Implementation(Arc::new(ImplementationError::from(e))))?;
+        Ok(OutputsUnknownTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().apply_output_owned_checks(checked),
+        )))))
     }
 }
 
@@ -1177,6 +1365,14 @@ impl ProvisionalProposal {
     }
 
     pub fn psbt_to_sign(&self) -> String { self.0.clone().psbt_to_sign().to_string() }
+
+    pub fn finalize_signed_proposal(&self, signed_psbt: String) -> ProvisionalProposalTransition {
+        ProvisionalProposalTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().finalize_proposal(|_| {
+                Ok(Psbt::from_str(&signed_psbt).map_err(ImplementationError::new)?)
+            }),
+        ))))
+    }
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -1432,6 +1628,29 @@ impl Monitor {
                 .and_then(|buf| buf.map(try_deserialize_tx).transpose())
                 .map_err(|e| ImplementationError::new(e).into())
         })))))
+    }
+    pub fn extract_fallback_txid(&self) -> String {
+        self.0.clone().extract_fallback_txid().to_string()
+    }
+
+    pub fn extract_payjoin_proposal_txid(&self) -> String {
+        self.0.clone().extract_payjoin_proposal_txid().to_string()
+    }
+
+    pub fn check_fallback_monitorable(&self) -> MonitorTransition {
+        MonitorTransition(Arc::new(RwLock::new(Some(self.0.clone().check_fallback_monitorable()))))
+    }
+
+    pub fn fallback_tx_exists(&self) -> MonitorTransition {
+        MonitorTransition(Arc::new(RwLock::new(Some(self.0.clone().fallback_tx_exists()))))
+    }
+
+    pub fn payjoin_tx_exists(
+        &self,
+        payjoin_tx: Vec<u8>,
+    ) -> Result<MonitorTransition, ForeignError> {
+        let tx = try_deserialize_tx(payjoin_tx)?;
+        Ok(MonitorTransition(Arc::new(RwLock::new(Some(self.0.clone().payjoin_tx_exists(tx))))))
     }
 }
 
