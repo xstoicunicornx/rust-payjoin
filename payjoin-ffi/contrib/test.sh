@@ -23,9 +23,16 @@ for pid in "${pids[@]}"; do
         echo "--- output ---"
         cat "${tmpfiles[$i]}"
         echo "--------------"
+    else
+        echo ""
+        echo "==> PASSED: $binding"
     fi
     rm -f "${tmpfiles[$i]}"
     i=$((i + 1))
 done
 set -e
+if [ $failed -eq 0 ]; then
+    echo ""
+    echo "All test suites passed!"
+fi
 exit $failed
