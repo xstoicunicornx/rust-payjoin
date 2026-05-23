@@ -632,7 +632,11 @@ impl Initialized {
             .map_err(Into::into)
     }
 
-    /// The response can either be an UncheckedOriginalPayload or an ACCEPTED message indicating no UncheckedOriginalPayload is available yet.
+    /// Process the polling response from the directory.
+    ///
+    /// Returns an [`InitializedTransition`] that, once persisted, yields either
+    /// an [`UncheckedOriginalPayload`] if the sender's Original PSBT is available,
+    /// or [`Initialized`] if no proposal has arrived yet.
     pub fn process_response(&self, body: &[u8], ctx: &ClientResponse) -> InitializedTransition {
         InitializedTransition(Arc::new(RwLock::new(Some(
             self.0.clone().process_response(body, ctx.into()),
@@ -713,6 +717,11 @@ pub trait CanBroadcast: Send + Sync {
 
 #[uniffi::export]
 impl UncheckedOriginalPayload {
+    /// Check that the sender's Original PSBT is suitable for broadcast, ensuring
+    /// it can be used as a fallback if the payjoin does not complete.
+    ///
+    /// Returns an [`UncheckedOriginalPayloadTransition`] that, once persisted,
+    /// yields a [`MaybeInputsOwned`] to continue validation.
     pub fn check_broadcast_suitability(
         &self,
         min_fee_rate_sat_per_kwu: Option<u64>,
@@ -728,12 +737,21 @@ impl UncheckedOriginalPayload {
         )))))
     }
 
+    /// Extract the transaction from the Original PSBT for external broadcast suitability checks.
+    ///
+    /// Returns the consensus-encoded raw transaction bytes.
     pub fn extract_tx_to_check_broadcast_suitability(&self) -> Vec<u8> {
         payjoin::bitcoin::consensus::encode::serialize(
             &self.0.clone().extract_tx_to_check_broadcast_suitability(),
         )
     }
 
+    /// Apply the result of an external broadcast suitability check, ensuring
+    /// the Original PSBT can be used as a fallback if the payjoin does
+    /// not complete.
+    ///
+    /// Returns an [`UncheckedOriginalPayloadTransition`] that, once persisted,
+    /// yields a [`MaybeInputsOwned`] to continue validation.
     pub fn apply_broadcast_suitability(
         &self,
         min_fee_rate_sat_per_kwu: Option<u64>,
@@ -853,13 +871,21 @@ pub trait IsScriptOwned: Send + Sync {
 
 #[uniffi::export]
 impl MaybeInputsOwned {
-    ///The Sender’s Original PSBT
+    /// Extract the transaction from the Original PSBT for scheduling broadcast as a
+    /// fallback in case the payjoin does not complete.
+    ///
+    /// Returns the consensus-encoded raw transaction bytes.
     pub fn extract_tx_to_schedule_broadcast(&self) -> Vec<u8> {
         payjoin::bitcoin::consensus::encode::serialize(
             &self.0.clone().extract_tx_to_schedule_broadcast(),
         )
     }
 
+    /// Check that none of the Original PSBT's inputs belong to the receiver,
+    /// preventing an attacker from spending the receiver's own inputs.
+    ///
+    /// Returns a [`MaybeInputsOwnedTransition`] that, once persisted,
+    /// yields a [`MaybeInputsSeen`] to continue validation.
     pub fn check_inputs_not_owned(
         &self,
         is_owned: Arc<dyn IsScriptOwned>,
@@ -871,6 +897,10 @@ impl MaybeInputsOwned {
         ))))
     }
 
+    /// Get references to the input scripts for external ownership checks.
+    ///
+    /// Each reference can be marked with the result via [`InputOwnedReference::mark`]
+    /// and passed to [`MaybeInputsOwned::apply_input_owned_checks`].
     pub fn get_input_script_refs(&self) -> Result<Vec<Arc<InputOwnedReference>>, ReceiverError> {
         self.0
             .clone()
@@ -882,6 +912,12 @@ impl MaybeInputsOwned {
             .map_err(ReceiverError::from)
     }
 
+    /// Apply the results of external input ownership checks, ensuring none of the
+    /// inputs are owned by the receiver. This prevents an attacker from spending
+    /// the receiver's own inputs.
+    ///
+    /// Returns a [`MaybeInputsOwnedTransition`] that, once persisted,
+    /// yields a [`MaybeInputsSeen`] to continue validation.
     pub fn apply_input_owned_checks(
         &self,
         checked_input_scripts: Vec<Arc<InputOwnedTaggedReference>>,
@@ -956,6 +992,12 @@ pub trait IsOutputKnown: Send + Sync {
 
 #[uniffi::export]
 impl MaybeInputsSeen {
+    /// Check that none of the inputs have been seen before, preventing input
+    /// probing and replay attacks (where inputs have been used in a previous
+    /// payjoin attempt).
+    ///
+    /// Returns a [`MaybeInputsSeenTransition`] that, once persisted,
+    /// yields an [`OutputsUnknown`] to continue validation.
     pub fn check_no_inputs_seen_before(
         &self,
         is_known: Arc<dyn IsOutputKnown>,
@@ -969,6 +1011,10 @@ impl MaybeInputsSeen {
         ))))
     }
 
+    /// Get references to the input outpoints for external outpoint seen checks.
+    ///
+    /// Each reference can be marked with the result via [`InputSeenReference::mark`]
+    /// and passed to [`MaybeInputsSeen::apply_input_seen_checks`].
     pub fn get_input_outpoint_refs(&self) -> Vec<Arc<InputSeenReference>> {
         self.0
             .clone()
@@ -977,6 +1023,12 @@ impl MaybeInputsSeen {
             .collect::<Vec<_>>()
     }
 
+    /// Apply the results of external outpoint seen checks, ensuring none of
+    /// the inputs have been seen before. This prevents input probing and replay
+    /// attacks (where inputs have been used in a previous payjoin attempt).
+    ///
+    /// Returns a [`MaybeInputsSeenTransition`] that, once persisted,
+    /// yields an [`OutputsUnknown`] to continue validation.
     pub fn apply_input_seen_checks(
         &self,
         checked_input_outpoints: Vec<Arc<InputSeenTaggedReference>>,
@@ -1048,7 +1100,11 @@ impl_save_for_transition!(OutputsUnknownTransition, WantsOutputs);
 
 #[uniffi::export]
 impl OutputsUnknown {
-    /// Find which outputs belong to the receiver
+    /// Identify which outputs in the original transaction belong to the receiver
+    /// and ensure at least one output pays the receiver.
+    ///
+    /// Returns an [`OutputsUnknownTransition`] that, once persisted,
+    /// yields a [`WantsOutputs`] to continue the proposal.
     pub fn identify_receiver_outputs(
         &self,
         is_receiver_output: Arc<dyn IsScriptOwned>,
@@ -1062,6 +1118,10 @@ impl OutputsUnknown {
         ))))
     }
 
+    /// Get references to the output scripts for external ownership checks.
+    ///
+    /// Each reference can be marked with the result via [`OutputOwnedReference::mark`]
+    /// and passed to [`OutputsUnknown::apply_output_owned_checks`].
     pub fn get_output_script_refs(&self) -> Vec<Arc<OutputOwnedReference>> {
         self.0
             .clone()
@@ -1070,6 +1130,12 @@ impl OutputsUnknown {
             .collect::<Vec<_>>()
     }
 
+    /// Apply the results of external output ownership checks, identifying which
+    /// outputs in the original transaction belong to the receiver and ensuring
+    /// at least one output pays the receiver.
+    ///
+    /// Returns an [`OutputsUnknownTransition`] that, once persisted,
+    /// yields a [`WantsOutputs`] to continue the proposal.
     pub fn apply_output_owned_checks(
         &self,
         checked_output_scripts: Vec<Arc<OutputOwnedTaggedReference>>,
@@ -1111,8 +1177,14 @@ impl_save_for_transition!(WantsOutputsTransition, WantsInputs);
 
 #[uniffi::export]
 impl WantsOutputs {
+    /// Returns whether output substitution is enabled for this session.
     pub fn output_substitution(&self) -> OutputSubstitution { self.0.output_substitution() }
 
+    /// Replace all receiver outputs with the provided `replacement_outputs`,
+    /// and set up the `drain_script` as the receiver-owned output whose value
+    /// may be adjusted based on modifications in subsequent states.
+    ///
+    /// Returns an updated [`WantsOutputs`] with the replaced outputs.
     pub fn replace_receiver_outputs(
         &self,
         replacement_outputs: Vec<TxOut>,
@@ -1130,6 +1202,9 @@ impl WantsOutputs {
             .map_err(Into::into)
     }
 
+    /// Substitute the receiver output script with the provided script.
+    ///
+    /// Returns an updated [`WantsOutputs`] with the substituted output.
     pub fn substitute_receiver_script(
         &self,
         output_script_pubkey: Vec<u8>,
@@ -1143,6 +1218,10 @@ impl WantsOutputs {
             .map_err(Into::into)
     }
 
+    /// Commit the output modifications and proceed to input contribution.
+    ///
+    /// Returns a [`WantsOutputsTransition`] that, once persisted,
+    /// yields a [`WantsInputs`].
     pub fn commit_outputs(&self) -> WantsOutputsTransition {
         WantsOutputsTransition(Arc::new(RwLock::new(Some(self.0.clone().commit_outputs()))))
     }
@@ -1199,6 +1278,9 @@ impl WantsInputs {
         }
     }
 
+    /// Add the provided inputs to the payjoin proposal.
+    ///
+    /// Returns an updated [`WantsInputs`] with the contributed inputs.
     pub fn contribute_inputs(
         &self,
         replacement_inputs: Vec<Arc<InputPair>>,
@@ -1212,6 +1294,10 @@ impl WantsInputs {
             .map_err(Into::into)
     }
 
+    /// Commit the input contributions and proceed to fee negotiation.
+    ///
+    /// Returns a [`WantsInputsTransition`] that, once persisted,
+    /// yields a [`WantsFeeRange`].
     pub fn commit_inputs(&self) -> WantsInputsTransition {
         WantsInputsTransition(Arc::new(RwLock::new(Some(self.0.clone().commit_inputs()))))
     }
@@ -1350,6 +1436,10 @@ pub trait ProcessPsbt: Send + Sync {
 
 #[uniffi::export]
 impl ProvisionalProposal {
+    /// Finalize the proposal by signing the PSBT via the `process_psbt` callback.
+    ///
+    /// Returns a [`ProvisionalProposalTransition`] that, once persisted,
+    /// yields the final [`PayjoinProposal`].
     pub fn finalize_proposal(
         &self,
         process_psbt: Arc<dyn ProcessPsbt>,
@@ -1364,8 +1454,13 @@ impl ProvisionalProposal {
         ))))
     }
 
+    /// Extract the PSBT that needs to be signed by the receiver's wallet.
     pub fn psbt_to_sign(&self) -> String { self.0.clone().psbt_to_sign().to_string() }
 
+    /// Finalize the proposal with a signed PSBT.
+    ///
+    /// Returns a [`ProvisionalProposalTransition`] that, once persisted,
+    /// yields the final [`PayjoinProposal`].
     pub fn finalize_signed_proposal(&self, signed_psbt: String) -> ProvisionalProposalTransition {
         ProvisionalProposalTransition(Arc::new(RwLock::new(Some(
             self.0.clone().finalize_proposal(|_| {
@@ -1414,6 +1509,8 @@ impl_save_for_transition!(PayjoinProposalTransition, Monitor);
 
 #[uniffi::export]
 impl PayjoinProposal {
+    /// Returns the outpoints of receiver UTXOs that should be locked to
+    /// prevent double-spending while the payjoin is in progress.
     pub fn utxos_to_be_locked(&self) -> Vec<OutPoint> {
         let mut outpoints: Vec<OutPoint> = Vec::new();
         for o in <PayjoinProposal as Into<
@@ -1426,6 +1523,7 @@ impl PayjoinProposal {
         outpoints
     }
 
+    /// Returns the finalized payjoin proposal PSBT.
     pub fn psbt(&self) -> String {
         <PayjoinProposal as Into<
             payjoin::receive::v2::Receiver<payjoin::receive::v2::PayjoinProposal>,
@@ -1529,6 +1627,8 @@ impl HasReplyableErrorTransition {
 
 #[uniffi::export]
 impl HasReplyableError {
+    /// Construct an OHTTP encapsulated POST request to post the receiver
+    /// error response to the directory so it can be retrieved by the sender.
     pub fn create_error_request(
         &self,
         ohttp_relay: String,
@@ -1538,6 +1638,11 @@ impl HasReplyableError {
         })
     }
 
+    /// Process the response from the directory after posting the receiver
+    /// error response.
+    ///
+    /// Returns a [`HasReplyableErrorTransition`] that, once persisted,
+    /// completes the error reporting.
     pub fn process_error_response(
         &self,
         body: &[u8],
@@ -1618,6 +1723,11 @@ fn try_deserialize_tx(
 
 #[uniffi::export]
 impl Monitor {
+    /// Check the network for the payjoin or fallback transaction via the
+    /// `transaction_exists` callback.
+    ///
+    /// Returns a [`MonitorTransition`] that, once persisted, completes
+    /// the session if a transaction is found.
     pub fn check_payment(
         &self,
         transaction_exists: Arc<dyn TransactionExists>,
@@ -1629,22 +1739,43 @@ impl Monitor {
                 .map_err(|e| ImplementationError::new(e).into())
         })))))
     }
+
+    /// Returns the txid of the fallback transaction.
     pub fn extract_fallback_txid(&self) -> String {
         self.0.clone().extract_fallback_txid().to_string()
     }
 
+    /// Returns the txid of the payjoin proposal transaction.
     pub fn extract_payjoin_proposal_txid(&self) -> String {
         self.0.clone().extract_payjoin_proposal_txid().to_string()
     }
 
+    /// Check whether the fallback transaction can be monitored. If the
+    /// fallback transaction includes non-SegWit inputs, the fallback
+    /// transaction ID can change when the sender signs again, making
+    /// monitoring impossible and concluding the session.
+    ///
+    /// Returns a [`MonitorTransition`] that, once persisted, yields a
+    /// [`Monitor`] to continue monitoring or completes the session if
+    /// monitoring is not possible.
     pub fn check_fallback_monitorable(&self) -> MonitorTransition {
         MonitorTransition(Arc::new(RwLock::new(Some(self.0.clone().check_fallback_monitorable()))))
     }
 
+    /// Signal that the fallback transaction exists on the network,
+    /// completing the session.
+    ///
+    /// Returns a [`MonitorTransition`] that, once persisted, completes
+    /// the session.
     pub fn fallback_tx_exists(&self) -> MonitorTransition {
         MonitorTransition(Arc::new(RwLock::new(Some(self.0.clone().fallback_tx_exists()))))
     }
 
+    /// Signal that the payjoin transaction exists on the network,
+    /// completing the session.
+    ///
+    /// Returns a [`MonitorTransition`] that, once persisted, completes
+    /// the session.
     pub fn payjoin_tx_exists(
         &self,
         payjoin_tx: Vec<u8>,
