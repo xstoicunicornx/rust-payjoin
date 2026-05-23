@@ -452,13 +452,13 @@ mod e2e {
             let res = tokio::time::timeout(
                 timeout,
                 wait_for_stdout_match(&mut stdout, |line| {
-                    line.contains("All resumed sessions completed.")
+                    line.starts_with("Session ") && line.ends_with(" completed.")
                 }),
             )
             .await?;
 
             terminate(cli_resumer).await.expect("Failed to kill payjoin-cli");
-            assert!(res.is_some(), "Expected all resumed sessions completed");
+            assert!(res.is_some(), "Expected resumed session completed");
             Ok(())
         }
         Ok(())

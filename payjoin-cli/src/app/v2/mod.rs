@@ -317,9 +317,14 @@ impl AppTrait for App {
             let recv_persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
             match replay_receiver_event_log(&recv_persister) {
                 Ok((receiver_state, _)) => {
-                    tasks.push(tokio::spawn(async move {
-                        self_clone.process_receiver_session(receiver_state, &recv_persister).await
-                    }));
+                    tasks.push((
+                        session_id,
+                        tokio::spawn(async move {
+                            self_clone
+                                .process_receiver_session(receiver_state, &recv_persister)
+                                .await
+                        }),
+                    ));
                 }
                 Err(e) => {
                     tracing::error!("An error {:?} occurred while replaying receiver session", e);
@@ -334,9 +339,12 @@ impl AppTrait for App {
             match replay_sender_event_log(&sender_persister) {
                 Ok((sender_state, _)) => {
                     let self_clone = self.clone();
-                    tasks.push(tokio::spawn(async move {
-                        self_clone.process_sender_session(sender_state, &sender_persister).await
-                    }));
+                    tasks.push((
+                        session_id,
+                        tokio::spawn(async move {
+                            self_clone.process_sender_session(sender_state, &sender_persister).await
+                        }),
+                    ));
                 }
                 Err(e) => {
                     tracing::error!("An error {:?} occurred while replaying Sender session", e);
@@ -348,11 +356,21 @@ impl AppTrait for App {
         let mut interrupt = self.interrupt.clone();
         tokio::select! {
             _ = async {
-                for task in tasks {
-                    let _ = task.await;
+                for (session_id, task) in tasks {
+                    match task.await {
+                        Ok(Err(e)) => {
+                            println!("Session {session_id} error: {e:#}");
+                            println!("Session {session_id} was stopped. Call the `resume` command to resume.");
+                        },
+                        Ok(_) => println!("Session {session_id} completed."),
+                        Err(e) => {
+                            println!("Session {session_id} error: {e:#}");
+                            println!("Session {session_id} was stopped. Call the `resume` command to resume.");
+                        },
+                    }
                 }
             } => {
-                println!("All resumed sessions completed.");
+                println!("Done")
             }
             _ = interrupt.changed() => {
                 println!("Resumed sessions were interrupted.");
@@ -859,15 +877,12 @@ impl App {
                     .save(persister);
 
                 match check_result {
-                    Ok(_) => {
+                    Ok(OptionalTransitionOutcome::Progress(())) => {
                         println!("Payjoin transaction detected in the mempool!");
                         return Ok(());
                     }
-                    Err(_) => {
-                        // keep polling
-
-                        continue;
-                    }
+                    Ok(OptionalTransitionOutcome::Stasis(_)) => continue,
+                    Err(_) => continue,
                 }
             }
         })
@@ -875,10 +890,7 @@ impl App {
 
         match result {
             Ok(ok) => ok,
-            Err(_) => Err(anyhow!(
-                "Timeout waiting for payment confirmation after {:?}",
-                timeout_duration
-            )),
+            Err(_) => Err(anyhow!("Polling timed out after {timeout_duration:?} sec.")),
         }
     }
 
