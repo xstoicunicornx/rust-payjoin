@@ -296,6 +296,10 @@ impl AppTrait for App {
         if let Some(max_fee_rate) = self.config.max_fee_rate {
             receiver_builder = receiver_builder.with_max_fee_rate(max_fee_rate);
         }
+        if let Some(expire_in_secs) = self.config.expire_in_secs {
+            let expiration = std::time::Duration::from_secs(expire_in_secs);
+            receiver_builder = receiver_builder.with_expiration(expiration);
+        }
         let session = receiver_builder.build().save(&persister)?;
         println!("Receive session established: {}", persister.session_id());
 
@@ -344,7 +348,15 @@ impl AppTrait for App {
                 }
                 Err(e) => {
                     if e.is_expired() {
-                        println!("Session {session_id} receiver expired.");
+                        match e.fallback_tx() {
+                            Some(tx) => println!(
+                                "Session {session_id} receiver expired. Broadcast the original transaction manually:\n{}",
+                                serialize_hex(tx)
+                            ),
+                            None => println!(
+                                "No fallback transaction available for expired receiver session {session_id}."
+                            ),
+                        }
                     } else {
                         tracing::error!(
                             "An error {:?} occurred while replaying receiver session",
@@ -372,7 +384,15 @@ impl AppTrait for App {
                 }
                 Err(e) => {
                     if e.is_expired() {
-                        println!("Session {session_id} sender expired.");
+                        match e.fallback_tx() {
+                            Some(tx) => println!(
+                                "Session {session_id} sender expired. Broadcast the original transaction manually:\n{}",
+                                serialize_hex(tx)
+                            ),
+                            None => println!(
+                                "No fallback transaction available for expired sender session {session_id}."
+                            ),
+                        }
                     } else {
                         tracing::error!("An error {:?} occurred while replaying Sender session", e);
                         println!("Session {session_id} sender failed to replay -  {e}");
@@ -577,7 +597,21 @@ impl AppTrait for App {
 impl App {
     fn cancel_sender_session(&self, session_id: SessionId, no_broadcast: bool) -> Result<()> {
         let persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
-        let (session, history) = replay_sender_event_log(&persister)?;
+        let (session, history) = match replay_sender_event_log(&persister) {
+            Ok((session, history)) => (session, history),
+            Err(e) if e.is_expired() => {
+                let tx = e.fallback_tx().cloned().ok_or_else(|| {
+                    anyhow!("Expired sender session {session_id} has no fallback transaction")
+                })?;
+                println!(
+                    "Session {session_id} expired. Broadcast the original transaction manually:\n{}",
+                    serialize_hex(&tx)
+                );
+                Self::close_failed_session(&persister, &session_id, "sender");
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow!("Failed to replay sender session {session_id}: {:?}", e)),
+        };
 
         let pending: Sender<SenderPendingFallback> = match session {
             SendSession::WithReplyKey(sender) => sender.cancel().save(&persister)?,
@@ -696,8 +730,28 @@ impl App {
         if let Err(close_err) = SessionPersister::close(persister) {
             tracing::error!("Failed to close {} session {}: {:?}", role, session_id, close_err);
         } else {
-            tracing::error!("Closed failed {} session: {}", role, session_id);
+            tracing::debug!("Closed failed {} session: {}", role, session_id);
         }
+    }
+
+    /// Cancel an expired sender session, print its fallback transaction hex,
+    /// close the session, and return Ok(()). Does NOT write a Close event to
+    /// the event log so that `history` displays the expiry error rather than
+    /// "Session aborted".
+    fn finalize_expired_sender(
+        &self,
+        pending: Sender<SenderPendingFallback>,
+        persister: &SenderPersister,
+    ) -> Result<()> {
+        let tx = pending.fallback_tx();
+        let session_id = persister.session_id();
+        println!(
+            "Session {} expired. Broadcast the original transaction manually:\n{}",
+            session_id,
+            serialize_hex(tx)
+        );
+        Self::close_failed_session(persister, &session_id, "sender");
+        Ok(())
     }
 
     async fn process_sender_session(
@@ -734,8 +788,24 @@ impl App {
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let (response, ctx) =
-            self.post_via_relay(|relay| sender.create_v2_post_request(relay)).await?;
+        let (response, ctx) = loop {
+            let relay = self.mailroom_manager.choose_relay()?;
+            let (req, ctx) = match sender.create_v2_post_request(relay.as_str()) {
+                Ok(r) => r,
+                Err(e) if e.is_expired() =>
+                    return self
+                        .finalize_expired_sender(sender.cancel().save(persister)?, persister),
+                Err(e) => return Err(e.into()),
+            };
+            match self.post_request(req).await {
+                Ok(resp) => break (resp, ctx),
+                Err(e) => {
+                    tracing::debug!("Request to relay {relay} failed: {e:?}");
+                    self.mailroom_manager.add_failed_relay(relay);
+                    continue;
+                }
+            }
+        };
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
         println!("Posted Original PSBT...");
         self.get_proposed_payjoin_psbt(sender, persister).await
@@ -747,26 +817,46 @@ impl App {
         persister: &SenderPersister,
     ) -> Result<()> {
         let mut session = sender.clone();
-        // Long poll until we get a response
+        // Long poll until we get a response. The session's expiration is enforced
+        // here: once `create_poll_request` reports expiry, the session is driven to
+        // a terminal `Closed(Aborted)` state and the fallback transaction is surfaced
+        // so it can be broadcast manually. The persisted terminal outcome prevents
+        // the session from being mistakenly resumed.
         loop {
-            let (response, ctx) =
-                self.post_via_relay(|relay| session.create_poll_request(relay)).await?;
-            let res = session.process_response(&response.bytes().await?, ctx).save(persister);
-            match res {
-                Ok(OptionalTransitionOutcome::Progress(psbt)) => {
-                    println!("Proposal received. Processing...");
-                    self.process_pj_response(psbt)?;
-                    return Ok(());
+            let relay = self.mailroom_manager.choose_relay()?;
+            let (req, ctx) = match session.create_poll_request(relay.as_str()) {
+                Ok(r) => r,
+                Err(e) if e.is_expired() =>
+                    return self
+                        .finalize_expired_sender(session.cancel().save(persister)?, persister),
+                Err(e) => return Err(e.into()),
+            };
+            match self.post_request(req).await {
+                Ok(response) => {
+                    let bytes = response.bytes().await?;
+                    let res = session.process_response(&bytes, ctx).save(persister);
+                    match res {
+                        Ok(OptionalTransitionOutcome::Progress(psbt)) => {
+                            println!("Proposal received. Processing...");
+                            self.process_pj_response(psbt)?;
+                            return Ok(());
+                        }
+                        Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
+                            println!("No response yet.");
+                            session = current_state;
+                            continue;
+                        }
+                        Err(re) => {
+                            println!("{re}");
+                            tracing::debug!("{re:?}");
+                            return Err(anyhow!("Response error").context(re));
+                        }
+                    }
                 }
-                Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
-                    println!("No response yet.");
-                    session = current_state;
+                Err(e) => {
+                    tracing::debug!("Request to relay {relay} failed: {e:?}");
+                    self.mailroom_manager.add_failed_relay(relay);
                     continue;
-                }
-                Err(re) => {
-                    println!("{re}");
-                    tracing::debug!("{re:?}");
-                    return Err(anyhow!("Response error").context(re));
                 }
             }
         }
@@ -779,22 +869,41 @@ impl App {
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
         let mut session = session;
         loop {
-            println!("Polling receive request...");
-            let (ohttp_response, context) =
-                self.post_via_relay(|relay| session.create_poll_request(relay)).await?;
-            let state_transition = session
-                .process_response(ohttp_response.bytes().await?.to_vec().as_slice(), context)
-                .save(persister);
-            match state_transition {
-                Ok(OptionalTransitionOutcome::Progress(next_state)) => {
-                    println!("Got a request from the sender. Responding with a Payjoin proposal.");
-                    return Ok(next_state);
-                }
-                Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
-                    session = current_state;
-                    continue;
+            let relay = self.mailroom_manager.choose_relay()?;
+            let (req, context) = match session.create_poll_request(relay.as_str()) {
+                Ok(r) => r,
+                Err(e) if e.is_expired() => {
+                    let session_id = persister.session_id();
+                    Self::close_failed_session(persister, &session_id, "receiver");
+                    return Err(anyhow!("Receiver session expired: {session_id}"));
                 }
                 Err(e) => return Err(e.into()),
+            };
+            println!("Polling receive request...");
+            match self.post_request(req).await {
+                Ok(ohttp_response) => {
+                    let bytes = ohttp_response.bytes().await?.to_vec();
+                    let state_transition =
+                        session.process_response(bytes.as_slice(), context).save(persister);
+                    match state_transition {
+                        Ok(OptionalTransitionOutcome::Progress(next_state)) => {
+                            println!(
+                                "Got a request from the sender. Responding with a Payjoin proposal."
+                            );
+                            return Ok(next_state);
+                        }
+                        Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
+                            session = current_state;
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Request to relay {relay} failed: {e:?}");
+                    self.mailroom_manager.add_failed_relay(relay);
+                    continue;
+                }
             }
         }
     }
