@@ -35,6 +35,34 @@ const W_ID: usize = 36;
 const W_ROLE: usize = 15;
 const W_STATUS: usize = 15;
 
+/// A request-construction error that can report whether it was caused by
+/// session expiry. Implemented by the sender/receiver request-building error
+/// types so `post_via_relay` can hand expiry back to the caller (which owns the
+/// typestate needed to react) instead of flattening it into `anyhow::Error`.
+trait RequestExpiry {
+    fn expired(&self) -> bool;
+}
+
+impl RequestExpiry for payjoin::send::v2::CreateRequestError {
+    fn expired(&self) -> bool { self.is_expired() }
+}
+
+impl RequestExpiry for payjoin::receive::v2::CreateRequestError {
+    fn expired(&self) -> bool { self.is_expired() }
+}
+
+impl RequestExpiry for payjoin::receive::v2::SessionError {
+    fn expired(&self) -> bool { self.is_expired() }
+}
+
+/// Outcome of building and posting a request via `post_via_relay`. HTTP
+/// failures are retried against other relays inside the helper; only session
+/// expiry and fatal build errors escape to the caller.
+enum RelayPost<T> {
+    Posted(reqwest::Response, T),
+    Expired,
+}
+
 #[derive(Clone)]
 pub(crate) struct App {
     config: Config,
@@ -787,24 +815,13 @@ impl App {
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let (response, ctx) = loop {
-            let relay = self.mailroom_manager.choose_relay()?;
-            let (req, ctx) = match sender.create_v2_post_request(relay.as_str()) {
-                Ok(r) => r,
-                Err(e) if e.is_expired() =>
+        let (response, ctx) =
+            match self.post_via_relay(|relay| sender.create_v2_post_request(relay)).await? {
+                RelayPost::Posted(resp, ctx) => (resp, ctx),
+                RelayPost::Expired =>
                     return self
                         .finalize_expired_sender(sender.cancel().save(persister)?, persister),
-                Err(e) => return Err(e.into()),
             };
-            match self.post_request(req).await {
-                Ok(resp) => break (resp, ctx),
-                Err(e) => {
-                    tracing::debug!("Request to relay {relay} failed: {e:?}");
-                    self.mailroom_manager.add_failed_relay(relay);
-                    continue;
-                }
-            }
-        };
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
         println!("Posted Original PSBT...");
         self.get_proposed_payjoin_psbt(sender, persister).await
@@ -822,40 +839,30 @@ impl App {
         // so it can be broadcast manually. The persisted terminal outcome prevents
         // the session from being mistakenly resumed.
         loop {
-            let relay = self.mailroom_manager.choose_relay()?;
-            let (req, ctx) = match session.create_poll_request(relay.as_str()) {
-                Ok(r) => r,
-                Err(e) if e.is_expired() =>
-                    return self
-                        .finalize_expired_sender(session.cancel().save(persister)?, persister),
-                Err(e) => return Err(e.into()),
-            };
-            match self.post_request(req).await {
-                Ok(response) => {
-                    let bytes = response.bytes().await?;
-                    let res = session.process_response(&bytes, ctx).save(persister);
-                    match res {
-                        Ok(OptionalTransitionOutcome::Progress(psbt)) => {
-                            println!("Proposal received. Processing...");
-                            self.process_pj_response(psbt)?;
-                            return Ok(());
-                        }
-                        Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
-                            println!("No response yet.");
-                            session = current_state;
-                            continue;
-                        }
-                        Err(re) => {
-                            println!("{re}");
-                            tracing::debug!("{re:?}");
-                            return Err(anyhow!("Response error").context(re));
-                        }
-                    }
+            let (response, ctx) =
+                match self.post_via_relay(|relay| session.create_poll_request(relay)).await? {
+                    RelayPost::Posted(resp, ctx) => (resp, ctx),
+                    RelayPost::Expired =>
+                        return self
+                            .finalize_expired_sender(session.cancel().save(persister)?, persister),
+                };
+            let bytes = response.bytes().await?;
+            let res = session.process_response(&bytes, ctx).save(persister);
+            match res {
+                Ok(OptionalTransitionOutcome::Progress(psbt)) => {
+                    println!("Proposal received. Processing...");
+                    self.process_pj_response(psbt)?;
+                    return Ok(());
                 }
-                Err(e) => {
-                    tracing::debug!("Request to relay {relay} failed: {e:?}");
-                    self.mailroom_manager.add_failed_relay(relay);
+                Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
+                    println!("No response yet.");
+                    session = current_state;
                     continue;
+                }
+                Err(re) => {
+                    println!("{re}");
+                    tracing::debug!("{re:?}");
+                    return Err(anyhow!("Response error").context(re));
                 }
             }
         }
@@ -868,41 +875,29 @@ impl App {
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
         let mut session = session;
         loop {
-            let relay = self.mailroom_manager.choose_relay()?;
-            let (req, context) = match session.create_poll_request(relay.as_str()) {
-                Ok(r) => r,
-                Err(e) if e.is_expired() => {
-                    let session_id = persister.session_id();
-                    Self::close_failed_session(persister, &session_id, "receiver");
-                    return Err(anyhow!("Receiver session expired: {session_id}"));
-                }
-                Err(e) => return Err(e.into()),
-            };
             println!("Polling receive request...");
-            match self.post_request(req).await {
-                Ok(ohttp_response) => {
-                    let bytes = ohttp_response.bytes().await?.to_vec();
-                    let state_transition =
-                        session.process_response(bytes.as_slice(), context).save(persister);
-                    match state_transition {
-                        Ok(OptionalTransitionOutcome::Progress(next_state)) => {
-                            println!(
-                                "Got a request from the sender. Responding with a Payjoin proposal."
-                            );
-                            return Ok(next_state);
-                        }
-                        Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
-                            session = current_state;
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
+            let (ohttp_response, context) =
+                match self.post_via_relay(|relay| session.create_poll_request(relay)).await? {
+                    RelayPost::Posted(resp, ctx) => (resp, ctx),
+                    RelayPost::Expired => {
+                        let session_id = persister.session_id();
+                        Self::close_failed_session(persister, &session_id, "receiver");
+                        return Err(anyhow!("Receiver session expired: {session_id}"));
                     }
+                };
+            let bytes = ohttp_response.bytes().await?.to_vec();
+            let state_transition =
+                session.process_response(bytes.as_slice(), context).save(persister);
+            match state_transition {
+                Ok(OptionalTransitionOutcome::Progress(next_state)) => {
+                    println!("Got a request from the sender. Responding with a Payjoin proposal.");
+                    return Ok(next_state);
                 }
-                Err(e) => {
-                    tracing::debug!("Request to relay {relay} failed: {e:?}");
-                    self.mailroom_manager.add_failed_relay(relay);
+                Ok(OptionalTransitionOutcome::Stasis(current_state)) => {
+                    session = current_state;
                     continue;
                 }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -1091,13 +1086,12 @@ impl App {
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (res, ohttp_ctx) = self
-            .post_via_relay(|relay| {
-                proposal
-                    .create_post_request(relay)
-                    .map_err(|e| anyhow!("v2 req extraction failed {}", e))
-            })
-            .await?;
+        let (res, ohttp_ctx) =
+            match self.post_via_relay(|relay| proposal.create_post_request(relay)).await? {
+                RelayPost::Posted(resp, ctx) => (resp, ctx),
+                RelayPost::Expired =>
+                    return Err(anyhow!("Session expired before the Payjoin proposal could be sent")),
+            };
         let payjoin_psbt = proposal.psbt().clone();
         let session = proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
         println!(
@@ -1159,13 +1153,12 @@ impl App {
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let (err_response, err_ctx) = self
-            .post_via_relay(|relay| {
-                session
-                    .create_error_request(relay)
-                    .map_err(|e| anyhow!("Failed to post error request: {}", e))
-            })
-            .await?;
+        let (err_response, err_ctx) =
+            match self.post_via_relay(|relay| session.create_error_request(relay)).await? {
+                RelayPost::Posted(resp, ctx) => (resp, ctx),
+                RelayPost::Expired =>
+                    return Err(anyhow!("Session expired before the error response could be sent")),
+            };
 
         let err_bytes = match err_response.bytes().await {
             Ok(bytes) => bytes,
@@ -1201,16 +1194,20 @@ impl App {
             .context("HTTP request failed")
     }
 
-    async fn post_via_relay<F, T, E>(&self, mut build: F) -> Result<(reqwest::Response, T)>
+    async fn post_via_relay<F, T, E>(&self, mut build: F) -> Result<RelayPost<T>>
     where
         F: FnMut(&str) -> std::result::Result<(payjoin::Request, T), E>,
-        E: Into<anyhow::Error>,
+        E: RequestExpiry + Into<anyhow::Error>,
     {
         loop {
             let relay = self.mailroom_manager.choose_relay()?;
-            let (req, ctx) = build(relay.as_str()).map_err(Into::into)?;
+            let (req, ctx) = match build(relay.as_str()) {
+                Ok(r) => r,
+                Err(e) if e.expired() => return Ok(RelayPost::Expired),
+                Err(e) => return Err(e.into()),
+            };
             match self.post_request(req).await {
-                Ok(resp) => return Ok((resp, ctx)),
+                Ok(resp) => return Ok(RelayPost::Posted(resp, ctx)),
                 Err(e) => {
                     tracing::debug!("Request to relay {relay} failed: {e:?}");
                     self.mailroom_manager.add_failed_relay(relay);
