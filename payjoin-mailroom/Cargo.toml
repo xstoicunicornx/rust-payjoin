@@ -25,6 +25,7 @@ telemetry = ["dep:opentelemetry-otlp"]
 
 [dependencies]
 anyhow = "1.0.99"
+async-trait = "0.1.89"
 axum = { version = "0.8", features = ["http2"] }
 axum-server = { version = "0.8", features = [
   "tls-rustls-no-provider",
@@ -57,6 +58,7 @@ ipnet = { version = "2.9", optional = true }
 maxminddb = { version = "0.27", optional = true }
 ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
 opentelemetry = "0.32"
+opentelemetry-http = { version = "0.32", features = ["hyper"] }
 opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = [
   "http-proto",
 ] }
