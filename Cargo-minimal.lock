@@ -2841,6 +2841,7 @@ name = "payjoin-mailroom"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "bhttp",
@@ -2863,6 +2864,7 @@ dependencies = [
  "maxminddb",
  "mockito",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "payjoin",
@@ -3388,7 +3390,9 @@ checksum = "d429f34c8092b2d42c7c93cec323bb4adeb7c67698f70839adec842ec10c7ceb"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
