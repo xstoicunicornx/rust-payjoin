@@ -18,6 +18,29 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "telemetry"))]
     let meter_provider = init_tracing();
 
+    let result = run(config, meter_provider.clone()).await;
+
+    // Flush the final metrics batch while the runtime is still alive; once
+    // main returns the provider's drop-time export would land on a dead
+    // runtime and be lost. shutdown() blocks on the export thread, whose HTTP
+    // requests need free runtime workers, so run it on the blocking pool to
+    // avoid deadlocking a single-worker runtime.
+    if let Some(provider) = meter_provider {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = provider.shutdown() {
+                tracing::warn!("Failed to shut down meter provider: {e}");
+            }
+        })
+        .await;
+    }
+
+    result
+}
+
+async fn run(
+    config: config::Config,
+    meter_provider: Option<SdkMeterProvider>,
+) -> anyhow::Result<()> {
     #[cfg(feature = "acme")]
     if config.acme.is_some() {
         return payjoin_mailroom::serve_acme(config, meter_provider).await;
