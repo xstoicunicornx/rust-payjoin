@@ -138,9 +138,12 @@ mod tests {
     ///    Basic-auth header, proving the encoding + auth path survived the
     ///    version bump.
     ///
-    /// If crypto-provider overlap ever returns (e.g. `aws-lc-rs` sneaks back
-    /// in alongside `ring`), the existing compile-time / link-time tests that
-    /// guard the rustls provider selection catch that; this test does not.
+    /// This test does not guard against crypto-provider overlap returning
+    /// (e.g. `aws-lc-rs` sneaking back in alongside `ring`). Nothing in the
+    /// codebase currently checks for that: the binary never installs a
+    /// provider explicitly, so a dependency change that reintroduces
+    /// `aws-lc-rs` would only surface as a rustls provider-selection error
+    /// at runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn otlp_exporter_posts_metrics_over_http() {
         let mut server = mockito::Server::new_async().await;
