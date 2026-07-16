@@ -21,11 +21,10 @@ ws-bootstrap = ["dep:tokio-tungstenite", "dep:rustls"]
 _manual-tls = ["dep:axum-server", "dep:rustls"]
 acme = ["dep:tokio-rustls-acme", "dep:axum-server", "dep:rustls"]
 access-control = ["dep:flate2", "dep:ipnet", "dep:maxminddb", "dep:reqwest"]
-telemetry = ["dep:opentelemetry-otlp", "dep:opentelemetry-http", "dep:async-trait"]
+telemetry = ["dep:opentelemetry-otlp", "dep:opentelemetry-http"]
 
 [dependencies]
 anyhow = "1.0.99"
-async-trait = { version = "0.1.89", optional = true }
 axum = { version = "0.8", features = ["http2"] }
 axum-server = { version = "0.8", features = [
   "tls-rustls-no-provider",

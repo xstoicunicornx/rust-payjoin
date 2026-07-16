@@ -3,9 +3,10 @@
 //! See [`build_otlp_meter_provider`] for the public entry point used by both
 //! the binary (`main.rs`) and the integration tests.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use opentelemetry::KeyValue;
 use opentelemetry_http::hyper::HyperClient;
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
@@ -102,7 +103,6 @@ where
     handle: tokio::runtime::Handle,
 }
 
-#[async_trait]
 impl<C> HttpClient for TokioDispatchClient<C>
 where
     C: hyper_util::client::legacy::connect::Connect
@@ -112,9 +112,21 @@ where
         + std::fmt::Debug
         + 'static,
 {
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+    // `HttpClient` is defined with #[async_trait], so this impl spells out the
+    // desugared signature by hand rather than pulling in the proc macro.
+    fn send_bytes<'life0, 'async_trait>(
+        &'life0 self,
+        request: Request<Bytes>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Bytes>, HttpError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
         let inner = self.inner.clone();
-        self.handle.spawn(async move { HttpClient::send_bytes(&inner, request).await }).await?
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            handle.spawn(async move { HttpClient::send_bytes(&inner, request).await }).await?
+        })
     }
 }
 
