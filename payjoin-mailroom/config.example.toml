@@ -26,6 +26,9 @@
 # This serves as an identifier for metrics collection.
 # operator_domain = "your-domain.example.com"
 
+# Timeout in seconds for each OTLP export request (default: 10)
+# export_timeout = 10
+
 # --- Access-control (requires `access-control` feature) ---
 # [access_control]
 

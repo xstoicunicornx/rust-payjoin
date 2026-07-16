@@ -27,6 +27,11 @@ use opentelemetry_sdk::Resource;
 /// subscriber; this function deliberately touches no global state so it remains
 /// unit-testable.
 ///
+/// `export_timeout` bounds each OTLP export request. It is enforced by the
+/// supplied `HyperClient`; the exporter builder's own timeout configuration
+/// (including `OTEL_EXPORTER_OTLP_TIMEOUT`) does not apply once a custom
+/// client is installed.
+///
 /// # Panics
 /// Panics if no Tokio runtime is active on the current thread. The OTLP
 /// exporter's `HyperClient` requires a Tokio context, which we capture here
@@ -36,6 +41,7 @@ pub fn build_otlp_meter_provider(
     endpoint: &str,
     auth_token: &str,
     operator_domain: &str,
+    export_timeout: Duration,
 ) -> SdkMeterProvider {
     let resource = Resource::builder()
         .with_service_name("payjoin-mailroom")
@@ -58,10 +64,8 @@ pub fn build_otlp_meter_provider(
     // ambient handle and dispatch each request onto it.
     let handle = tokio::runtime::Handle::try_current()
         .expect("build_otlp_meter_provider must be called from a Tokio runtime");
-    let http_client = TokioDispatchClient {
-        inner: HyperClient::new(connector, Duration::from_secs(10), None),
-        handle,
-    };
+    let http_client =
+        TokioDispatchClient { inner: HyperClient::new(connector, export_timeout, None), handle };
 
     let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
@@ -148,7 +152,12 @@ mod tests {
             .create_async()
             .await;
 
-        let provider = build_otlp_meter_provider(&server.url(), "dXNlcjpwYXNz", "test.example.com");
+        let provider = build_otlp_meter_provider(
+            &server.url(),
+            "dXNlcjpwYXNz",
+            "test.example.com",
+            Duration::from_secs(10),
+        );
 
         // Drive a real meter through the same MetricsService the app uses so
         // the export batch is non-empty.

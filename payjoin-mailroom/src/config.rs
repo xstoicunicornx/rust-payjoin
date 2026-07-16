@@ -44,7 +44,12 @@ pub struct TelemetryConfig {
     pub endpoint: String,
     pub auth_token: String,
     pub operator_domain: String,
+    #[serde(default = "default_export_timeout", deserialize_with = "deserialize_duration_secs")]
+    pub export_timeout: Duration,
 }
+
+#[cfg(feature = "telemetry")]
+fn default_export_timeout() -> Duration { Duration::from_secs(10) }
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Clone, Deserialize)]

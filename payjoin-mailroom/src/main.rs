@@ -40,6 +40,7 @@ fn init_tracing_with_telemetry(telemetry: &config::TelemetryConfig) -> SdkMeterP
         &telemetry.endpoint,
         &telemetry.auth_token,
         &telemetry.operator_domain,
+        telemetry.export_timeout,
     );
 
     let env_filter =
