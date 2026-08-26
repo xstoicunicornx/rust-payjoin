@@ -7,6 +7,15 @@ use reqwest::{Client, Proxy};
 use crate::into_url::IntoUrl;
 use crate::OhttpKeys;
 
+/// Upper bound on the size of an OHTTP key configuration response body.
+///
+/// Derived from the ECHKeyConfig wire format: `key_id(1) + kem_id(2) +
+/// K-256 public key(65) + cipher suite vector length(2) + cipher suites` where
+/// the suite vector is u16-length-bounded (at most 65532 bytes of suites). Any
+/// larger response cannot decode and is rejected before being fully buffered
+/// to prevent memory exhaustion from a hostile payjoin directory.
+pub const MAX_OHTTP_KEYS_BODY_LEN: usize = 1 + 2 + 65 + 2 + u16::MAX as usize - 3;
+
 /// Fetch the ohttp keys from the specified payjoin directory via proxy.
 ///
 /// * `ohttp_relay`: The http CONNECT method proxy to request the ohttp keys from a payjoin
@@ -69,7 +78,21 @@ async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, 
         return Err(Error::UnexpectedStatusCode(res.status()));
     }
 
-    let body = res.bytes().await?.to_vec();
+    if let Some(len) = res.content_length() {
+        if len as usize > MAX_OHTTP_KEYS_BODY_LEN {
+            return Err(Error::OhttpKeysBodyTooLarge(len));
+        }
+    }
+
+    let mut body = Vec::with_capacity(MAX_OHTTP_KEYS_BODY_LEN);
+    let mut res = res;
+    while let Some(chunk) = res.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_OHTTP_KEYS_BODY_LEN {
+            return Err(Error::OhttpKeysBodyTooLarge(body.len() as u64));
+        }
+    }
+
     OhttpKeys::decode(&body).map_err(|e| {
         Error::Internal(InternalError(InternalErrorInner::InvalidOhttpKeys(e.to_string())))
     })
@@ -80,6 +103,9 @@ async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, 
 pub enum Error {
     /// When the payjoin directory returns an unexpected status code
     UnexpectedStatusCode(http::StatusCode),
+    /// When the payjoin directory returns an OHTTP key configuration body
+    /// larger than [`MAX_OHTTP_KEYS_BODY_LEN`]
+    OhttpKeysBodyTooLarge(u64),
     /// Internal errors that should not be pattern matched by users
     #[doc(hidden)]
     Internal(InternalError),
@@ -126,6 +152,10 @@ impl std::fmt::Display for Error {
             Self::UnexpectedStatusCode(code) => {
                 write!(f, "Unexpected status code from payjoin directory: {code}")
             }
+            Self::OhttpKeysBodyTooLarge(len) => write!(
+                f,
+                "OHTTP keys body of {len} bytes exceeds the maximum of {MAX_OHTTP_KEYS_BODY_LEN} bytes"
+            ),
             Self::Internal(InternalError(e)) => e.fmt(f),
         }
     }
@@ -153,6 +183,7 @@ impl std::error::Error for Error {
         match self {
             Self::Internal(InternalError(e)) => e.source(),
             Self::UnexpectedStatusCode(_) => None,
+            Self::OhttpKeysBodyTooLarge(_) => None,
         }
     }
 }
@@ -232,6 +263,35 @@ mod tests {
                 Err(Error::Internal(InternalError(InternalErrorInner::InvalidOhttpKeys(_))))
             ),
             "expected InvalidOhttpKeys error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_body_len_boundary() {
+        // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
+        let response = mock_response(StatusCode::OK, vec![0u8; 65602]);
+        assert!(
+            matches!(
+                parse_ohttp_keys_response(response).await,
+                Err(Error::Internal(InternalError(InternalErrorInner::InvalidOhttpKeys(_))))
+            ),
+            "body of exactly MAX_OHTTP_KEYS_BODY_LEN must not be rejected as oversized"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_oversized_body_without_content_length() {
+        // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
+        let oversized_body = vec![0u8; 65602 + 1];
+
+        let response = mock_response(StatusCode::OK, oversized_body);
+
+        assert!(
+            matches!(
+                parse_ohttp_keys_response(response).await,
+                Err(Error::OhttpKeysBodyTooLarge(_))
+            ),
+            "expected OhttpKeysBodyTooLarge error"
         );
     }
 }
