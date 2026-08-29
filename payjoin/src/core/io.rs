@@ -213,10 +213,27 @@ impl From<InternalErrorInner> for Error {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use http::StatusCode;
     use reqwest::Response;
 
     use super::*;
+
+    struct UnknownLengthBody(reqwest::Body);
+
+    impl http_body::Body for UnknownLengthBody {
+        type Data = <reqwest::Body as http_body::Body>::Data;
+        type Error = <reqwest::Body as http_body::Body>::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            http_body::Body::poll_frame(Pin::new(&mut self.0), cx)
+        }
+    }
 
     fn mock_response(status: StatusCode, body: Vec<u8>) -> Response {
         Response::from(http::response::Response::builder().status(status).body(body).unwrap())
@@ -284,7 +301,11 @@ mod tests {
         // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
         let oversized_body = vec![0u8; 65602 + 1];
 
-        let response = mock_response(StatusCode::OK, oversized_body);
+        let body = reqwest::Body::wrap(UnknownLengthBody(reqwest::Body::from(oversized_body)));
+        let response = Response::from(
+            http::response::Response::builder().status(StatusCode::OK).body(body).unwrap(),
+        );
+        assert_eq!(response.content_length(), None);
 
         assert!(
             matches!(
