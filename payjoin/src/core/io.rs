@@ -79,7 +79,7 @@ async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, 
     }
 
     if let Some(len) = res.content_length() {
-        if len as usize > MAX_OHTTP_KEYS_BODY_LEN {
+        if len > MAX_OHTTP_KEYS_BODY_LEN as u64 {
             return Err(Error::OhttpKeysBodyTooLarge(len));
         }
     }
