@@ -87,10 +87,11 @@ async fn parse_ohttp_keys_response(res: reqwest::Response) -> Result<OhttpKeys, 
     let mut body = Vec::with_capacity(MAX_OHTTP_KEYS_BODY_LEN);
     let mut res = res;
     while let Some(chunk) = res.chunk().await? {
-        body.extend_from_slice(&chunk);
-        if body.len() > MAX_OHTTP_KEYS_BODY_LEN {
-            return Err(Error::OhttpKeysBodyTooLarge(body.len() as u64));
+        if chunk.len() > MAX_OHTTP_KEYS_BODY_LEN.saturating_sub(body.len()) {
+            let len = body.len().saturating_add(chunk.len()) as u64;
+            return Err(Error::OhttpKeysBodyTooLarge(len));
         }
+        body.extend_from_slice(&chunk);
     }
 
     OhttpKeys::decode(&body).map_err(|e| {
