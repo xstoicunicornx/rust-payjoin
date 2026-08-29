@@ -9,11 +9,18 @@ use crate::OhttpKeys;
 
 /// Upper bound on the size of an OHTTP key configuration response body.
 ///
-/// Derived from the ECHKeyConfig wire format: `key_id(1) + kem_id(2) +
-/// K-256 public key(65) + cipher suite vector length(2) + cipher suites` where
-/// the suite vector is u16-length-bounded (at most 65532 bytes of suites). Any
-/// larger response cannot decode and is rejected before being fully buffered
-/// to prevent memory exhaustion from a hostile payjoin directory.
+/// Derived from the OHTTP key configuration wire format (RFC 9458):
+/// `key_id(1) + kem_id(2) + public key(65) + suite vector length(2) + suites`.
+///
+/// The public key is 65 bytes because the `ohttp` backend supports a single
+/// KEM, DHKEM(secp256k1, HKDF-SHA256), whose points are uncompressed. The suite
+/// vector is u16-length-bounded, and each suite is a 2-byte KDF id plus a
+/// 2-byte AEAD id, so its length must be a multiple of 4. That caps the suites
+/// at 65532 bytes rather than 65535, which is where the `- 3` comes from.
+///
+/// A larger response cannot decode, so it is rejected before being fully
+/// buffered rather than buffered to find out. This keeps a hostile payjoin
+/// directory from exhausting client memory on a key fetch.
 pub const MAX_OHTTP_KEYS_BODY_LEN: usize = 1 + 2 + 65 + 2 + u16::MAX as usize - 3;
 
 /// Fetch the ohttp keys from the specified payjoin directory via proxy.
