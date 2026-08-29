@@ -213,6 +213,9 @@ impl From<InternalErrorInner> for Error {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use http::StatusCode;
     use reqwest::Response;
 
@@ -220,6 +223,39 @@ mod tests {
 
     fn mock_response(status: StatusCode, body: Vec<u8>) -> Response {
         Response::from(http::response::Response::builder().status(status).body(body).unwrap())
+    }
+
+    /// Wraps a body so it reports no exact size, the way a `Transfer-Encoding:
+    /// chunked` response does. `reqwest::Response::content_length` reads the
+    /// body's size hint rather than a header, so a plain `Vec<u8>` body always
+    /// has a known length and never reaches the streaming size check.
+    struct UnknownLengthBody(reqwest::Body);
+
+    impl http_body::Body for UnknownLengthBody {
+        type Data = <reqwest::Body as http_body::Body>::Data;
+        type Error = <reqwest::Body as http_body::Body>::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Pin::new(&mut self.0).poll_frame(cx)
+        }
+    }
+
+    /// Builds a 200 response whose body length is unknown up front, forcing
+    /// `parse_ohttp_keys_response` through its streaming size check.
+    fn mock_chunked_response(body: Vec<u8>) -> Response {
+        let body = reqwest::Body::wrap(UnknownLengthBody(reqwest::Body::from(body)));
+        let response = Response::from(
+            http::response::Response::builder().status(StatusCode::OK).body(body).unwrap(),
+        );
+        assert_eq!(
+            response.content_length(),
+            None,
+            "chunked mock must have no known length, or the streaming check is never exercised"
+        );
+        response
     }
 
     #[tokio::test]
@@ -280,18 +316,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parse_oversized_body_with_content_length() {
+        // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
+        let response = mock_response(StatusCode::OK, vec![0u8; 65602 + 1]);
+        assert_eq!(response.content_length(), Some(65602 + 1));
+
+        assert!(
+            matches!(
+                parse_ohttp_keys_response(response).await,
+                Err(Error::OhttpKeysBodyTooLarge(len)) if len == 65602 + 1
+            ),
+            "expected OhttpKeysBodyTooLarge from the declared length"
+        );
+    }
+
+    #[tokio::test]
     async fn test_parse_oversized_body_without_content_length() {
         // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
-        let oversized_body = vec![0u8; 65602 + 1];
-
-        let response = mock_response(StatusCode::OK, oversized_body);
+        let response = mock_chunked_response(vec![0u8; 65602 + 1]);
 
         assert!(
             matches!(
                 parse_ohttp_keys_response(response).await,
                 Err(Error::OhttpKeysBodyTooLarge(_))
             ),
-            "expected OhttpKeysBodyTooLarge error"
+            "expected OhttpKeysBodyTooLarge from the streaming check"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_body_without_content_length_at_boundary() {
+        // number is literal pin of MAX_OHTTP_KEYS_BODY_LEN
+        let response = mock_chunked_response(vec![0u8; 65602]);
+
+        assert!(
+            matches!(
+                parse_ohttp_keys_response(response).await,
+                Err(Error::Internal(InternalError(InternalErrorInner::InvalidOhttpKeys(_))))
+            ),
+            "streamed body of exactly MAX_OHTTP_KEYS_BODY_LEN must not be rejected as oversized"
         );
     }
 }
