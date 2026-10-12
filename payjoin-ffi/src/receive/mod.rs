@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 pub use error::{
     AddressParseError, BuildReceiverError, CoinSelectionError, InputContributionError,
     InputPairError, JsonReply, OutputSubstitutionError, ProtocolError, PsbtInputError,
-    ReceiverCreateRequestError, ReceiverError, SessionError,
+    ReceiverCreateRequestError, ReceiverError, SessionError, TransactionParseError,
 };
 use payjoin::bitcoin::consensus::Decodable;
 use payjoin::bitcoin::psbt::Psbt;
@@ -1885,6 +1885,7 @@ impl MonitorTransition {
     }
 }
 
+/// Completed Payjoin proposal that has been posted to the sender.
 #[derive(uniffi::Object)]
 pub struct Monitor(pub payjoin::receive::v2::Receiver<payjoin::receive::v2::Monitor>);
 
@@ -1901,13 +1902,187 @@ fn try_deserialize_tx(
         .map_err(|e| ForeignError::InternalError(e.to_string()))
 }
 
+/// Which transaction settled a session's contested prevouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SettlementOutcome {
+    /// This session's Payjoin proposal settled.
+    Payjoin,
+    /// This session's fallback transaction settled: paid, without
+    /// cooperation.
+    Fallback,
+    /// Some other transaction spent the contested prevouts, for example the
+    /// sender re-spending elsewhere.
+    Unrecognized,
+}
+
+impl From<payjoin::receive::v2::SettlementOutcome> for SettlementOutcome {
+    fn from(value: payjoin::receive::v2::SettlementOutcome) -> Self {
+        use payjoin::receive::v2::SettlementOutcome as Core;
+
+        match value {
+            Core::Payjoin => SettlementOutcome::Payjoin,
+            Core::Fallback => SettlementOutcome::Fallback,
+            Core::Unrecognized => SettlementOutcome::Unrecognized,
+            // The core `SettlementOutcome` is non_exhaustive; report a verdict
+            // this binding does not yet know as unrecognized.
+            _ => SettlementOutcome::Unrecognized,
+        }
+    }
+}
+
+/// The Payjoin proposal's on-chain txid, where the receiver can know it in
+/// advance.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ExpectedTxid {
+    /// Every sender input is native SegWit, so signing leaves the txid
+    /// unchanged.
+    Stable { txid: String },
+    /// A sender input finalizes with a non-empty script_sig, so signing
+    /// changes the txid and the on-chain txid is unknowable in advance.
+    Unstable,
+}
+
+impl From<payjoin::receive::v2::ExpectedTxid> for ExpectedTxid {
+    fn from(value: payjoin::receive::v2::ExpectedTxid) -> Self {
+        match value {
+            payjoin::receive::v2::ExpectedTxid::Stable(txid) =>
+                ExpectedTxid::Stable { txid: txid.to_string() },
+            payjoin::receive::v2::ExpectedTxid::Unstable => ExpectedTxid::Unstable,
+        }
+    }
+}
+
+/// A transition produced by closing a [`Monitor`] session.
+#[derive(uniffi::Object)]
+#[allow(clippy::type_complexity)]
+pub struct MonitorCloseTransition(
+    Arc<
+        RwLock<
+            Option<payjoin::persist::TerminalTransition<payjoin::receive::v2::SessionEvent, ()>>,
+        >,
+    >,
+);
+
+#[uniffi::export]
+impl MonitorCloseTransition {
+    pub fn save(
+        &self,
+        persister: Arc<dyn JsonReceiverSessionPersister>,
+    ) -> Result<(), ReceiverPersistedError> {
+        let adapter = CallbackPersisterAdapter::new(persister);
+        let mut inner = self.0.write().expect("Lock should not be poisoned");
+
+        let value = inner.take().expect("Already saved or moved");
+
+        value
+            .save(&adapter)
+            .map_err(|e| ReceiverPersistedError::from(ImplementationError::new(e)))?;
+        Ok(())
+    }
+
+    pub async fn save_async(
+        &self,
+        persister: Arc<dyn JsonReceiverSessionPersisterAsync>,
+    ) -> Result<(), ReceiverPersistedError> {
+        let adapter = AsyncCallbackPersisterAdapter::new(persister);
+        let value = {
+            let mut inner = self.0.write().expect("Lock should not be poisoned");
+            inner.take().expect("Already saved or moved")
+        };
+
+        value
+            .save_async(&adapter)
+            .await
+            .map_err(|e| ReceiverPersistedError::from(ImplementationError::new(e)))?;
+        Ok(())
+    }
+}
+
+/// Completed Payjoin proposal that has been posted to the sender.
+///
+/// Watch the [`contested_prevouts`](Monitor::contested_prevouts), pass any
+/// transaction that spends them to [`classify`](Monitor::classify), and call
+/// [`close`](Monitor::close) once the result meets your confirmation bar. The
+/// wallet supplies chain access and chooses that bar.
 #[uniffi::export]
 impl Monitor {
-    /// Check the network for the payjoin or fallback transaction via the
+    /// The txid the Payjoin proposal will have on chain.
+    ///
+    /// The txid includes the script_sigs of the receiver's finalized inputs,
+    /// which a legacy or P2SH-wrapped receiver input fills.
+    /// [`ExpectedTxid::Unstable`] if a sender input finalizes with a non-empty
+    /// script_sig, since the sender's signature then changes the txid.
+    pub fn expected_payjoin_txid(&self) -> ExpectedTxid { self.0.expected_payjoin_txid().into() }
+
+    /// The consensus-encoded fallback transaction the sender may broadcast
+    /// instead of the proposal.
+    pub fn fallback_tx(&self) -> Vec<u8> {
+        payjoin::bitcoin::consensus::encode::serialize(&self.0.fallback_tx())
+    }
+
+    /// The prevouts the sender's original transaction spends.
+    ///
+    /// The proposal and the fallback both spend all of them, so a transaction
+    /// spending any one of them conflicts with both. Watch these and pass what
+    /// spends them to [`classify`](Monitor::classify).
+    ///
+    /// When [`expected_payjoin_txid`](Monitor::expected_payjoin_txid) is
+    /// [`ExpectedTxid::Unstable`] this is the only way to find the proposal.
+    /// In either case it is the only way to find a spend that is neither the
+    /// proposal nor the fallback.
+    pub fn contested_prevouts(&self) -> Vec<OutPoint> {
+        self.0.contested_prevouts().map(Into::into).collect()
+    }
+
+    /// The prevouts the receiver contributed to the proposal.
+    ///
+    /// Empty for an output-substitution-only Payjoin.
+    pub fn receiver_prevouts(&self) -> Vec<OutPoint> {
+        self.0.receiver_prevouts().map(Into::into).collect()
+    }
+
+    /// Classify a consensus-encoded transaction against this session's
+    /// Payjoin proposal and fallback.
+    ///
+    /// Returns `None` if `tx` spends none of the
+    /// [`contested_prevouts`](Monitor::contested_prevouts), since it then says
+    /// nothing about this session. Otherwise returns
+    /// [`SettlementOutcome::Fallback`] if `tx` is the fallback,
+    /// [`SettlementOutcome::Payjoin`] if it is the proposal, and
+    /// [`SettlementOutcome::Unrecognized`] for any other spend. A proposal
+    /// identical to the original reports as the fallback.
+    ///
+    /// If more than one transaction spends the contested prevouts, classify
+    /// the one with the most confirmations.
+    pub fn classify(
+        &self,
+        tx: Vec<u8>,
+    ) -> Result<Option<SettlementOutcome>, TransactionParseError> {
+        let tx = payjoin::bitcoin::Transaction::consensus_decode(&mut tx.as_slice())
+            .map_err(|e| TransactionParseError::InvalidTransaction(e.to_string()))?;
+        Ok(self.0.classify(&tx).map(Into::into))
+    }
+
+    /// Close the session once the wallet no longer needs to track settlement.
+    ///
+    /// Returns a [`MonitorCloseTransition`] that, once persisted, closes the
+    /// session.
+    pub fn close(&self) -> MonitorCloseTransition {
+        MonitorCloseTransition(Arc::new(RwLock::new(Some(self.0.clone().close()))))
+    }
+
+    /// Check the network for the Payjoin or fallback transaction via the
     /// `find_transaction` callback.
     ///
     /// Returns a [`MonitorTransition`] that, once persisted, completes
     /// the session if a transaction is found.
+    ///
+    /// Probes only the proposal and fallback txids and closes on the first
+    /// match. When [`expected_payjoin_txid`](Monitor::expected_payjoin_txid)
+    /// is [`ExpectedTxid::Unstable`] it closes the session without checking.
+    ///
+    /// Deprecated since payjoin 1.3.0: use [`classify`](Monitor::classify) and
+    /// [`close`](Monitor::close).
     #[allow(deprecated)]
     pub fn check_for_transaction(
         &self,
@@ -1929,17 +2104,22 @@ macro_rules! impl_proposal_txid_is_stable {
         $(
             #[uniffi::export]
             impl $state {
-                /// Whether the payjoin proposal's transaction ID is knowable in advance.
+                /// Whether the sender's signatures leave the Payjoin proposal's
+                /// transaction ID unchanged.
                 ///
-                /// If every sender input is native SegWit (empty script_sig), the
-                /// transaction ID computed from the unsigned proposal remains valid once
-                /// the sender re-signs, so the receiver can record it (e.g. to reconcile
-                /// an incoming payment) and monitor the network for it. If any sender
-                /// input finalizes with a non-empty script_sig — legacy inputs, but also
-                /// P2SH-wrapped SegWit — the sender's final script_sig changes the
-                /// transaction ID: any ID derived from the proposal before the sender
-                /// signs will never appear on the network, and monitoring concludes the
-                /// session without checking.
+                /// True if every sender input is native SegWit (empty script_sig). A
+                /// legacy or P2SH-wrapped SegWit sender input finalizes with a
+                /// non-empty script_sig, which changes the transaction ID.
+                ///
+                /// This checks only the sender's inputs. A legacy or P2SH-wrapped
+                /// input the receiver contributes also carries a script_sig, so a
+                /// transaction ID computed from the unsigned proposal can be wrong
+                /// even when this returns true. `expected_payjoin_txid` on `Monitor`
+                /// accounts for both, and `classify` on `Monitor` recognizes the
+                /// proposal either way.
+                ///
+                /// Deprecated since payjoin 1.3.0: use `expected_payjoin_txid` on
+                /// `Monitor`.
                 #[allow(deprecated)]
                 pub fn proposal_txid_is_stable(&self) -> bool {
                     self.0.proposal_txid_is_stable()
