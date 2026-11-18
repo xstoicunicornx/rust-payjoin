@@ -1608,7 +1608,7 @@ mod e2e {
         use hyper::{Request, Response};
         use hyper_util::rt::TokioIo;
         use payjoin::bitcoin::psbt::{Input, Psbt};
-        use payjoin::bitcoin::{OutPoint, ScriptBuf, TxIn, TxOut, Witness};
+        use payjoin::bitcoin::{OutPoint, ScriptBuf, TxIn, TxOut};
         use payjoin_test_utils::local_cert_key;
         use serde_json::{json, Value};
         use tokio::net::TcpListener;
@@ -1649,6 +1649,8 @@ mod e2e {
                 .unwrap(),
         )?;
 
+        let sender = Arc::new(sender);
+        let signer = sender.clone();
         // A v1 receiver whose proposal adds the sender's other coin, finalized.
         let proposal_for = move |original: Psbt| -> (Psbt, OutPoint) {
             let mut proposal = original.clone();
@@ -1668,11 +1670,7 @@ mod e2e {
                 sequence: original.unsigned_tx.input[0].sequence,
                 ..Default::default()
             });
-            proposal.inputs.push(Input {
-                witness_utxo: Some(txout.clone()),
-                final_script_witness: Some(Witness::from_slice(&[[0u8; 72].as_slice()])),
-                ..Default::default()
-            });
+            proposal.inputs.push(Input { witness_utxo: Some(txout.clone()), ..Default::default() });
             let payee = proposal
                 .unsigned_tx
                 .output
@@ -1680,6 +1678,28 @@ mod e2e {
                 .find(|txout| txout.script_pubkey == payee_script)
                 .expect("original transaction pays the receiver");
             payee.value += txout.value - Amount::from_sat(1000);
+            // Give the added input a valid final witness, signed by the
+            // sender's own wallet over the final proposal transaction.
+            let signed: Psbt = signer
+                .call::<Value>(
+                    "walletprocesspsbt",
+                    &[
+                        json!(proposal.to_string()),
+                        json!(true),
+                        json!("ALL"),
+                        json!(true),
+                        json!(true),
+                    ],
+                )
+                .expect("walletprocesspsbt")["psbt"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let added = proposal.inputs.len() - 1;
+            let witness = signed.inputs[added].final_script_witness.clone();
+            assert!(witness.as_ref().is_some_and(|w| !w.is_empty()), "added input signed");
+            proposal.inputs[added].final_script_witness = witness;
             (proposal, outpoint)
         };
         let added_outpoint = Arc::new(std::sync::Mutex::new(None));
@@ -1731,7 +1751,7 @@ mod e2e {
             .arg("--fee-rate")
             .arg("1")
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?;
         let output = tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
@@ -1741,9 +1761,12 @@ mod e2e {
         server.abort();
         let stdout = String::from_utf8(output.stdout)?;
         println!("{stdout}");
+        let stderr = String::from_utf8(output.stderr)?;
+        eprintln!("{stderr}");
 
         let added_outpoint = added_outpoint.lock().unwrap().expect("receiver sent a proposal");
         assert!(!output.status.success(), "sender must refuse the proposal");
+        assert!(stderr.contains("Refusing to sign"), "sender must refuse before signing");
         assert!(!stdout.contains("Payjoin sent"), "sender must not broadcast the proposal");
         assert!(
             stdout.contains("To broadcast the fallback transaction"),
